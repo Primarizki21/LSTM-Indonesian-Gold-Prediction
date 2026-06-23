@@ -1,0 +1,13 @@
+[project]
+name = "lstm-multivariate-gold-prediction"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "ipykernel>=7.3.0",
+    "requests>=2.32",
+    "beautifulsoup4>=4.12",
+    "polars>=1.0",
+    "urllib3>=2.0",
+]
