@@ -125,9 +125,89 @@ def scrape_harga_emas(tahun, bulan, tanggal, max_retry=5):
     return None
 
 
-def scrape_range(start_date, end_date, delay=1.0, output_dir='data_emas'):
+def load_scrape_index(output_dir):
+    """Load set of tanggal yang sudah pernah di-attempt.
+    Auto-seed dari per-month parquets kalau sidecar belum ada (first run).
+    """
+    path = f"{output_dir}/.scrape_index.parquet"
+    attempted = set()
+    if os.path.exists(path):
+        df = pl.read_parquet(path)
+        attempted = set(df['tanggal'].dt.strftime('%Y-%m-%d').to_list())
+        return attempted
+
+    # First run: seed dari per-month parquets (data dates only)
+    # Off-days di masa lalu akan di-retry sekali, lalu di-cache permanent
+    if os.path.exists(output_dir):
+        for f in os.listdir(output_dir):
+            if f.endswith('.parquet') and not f.startswith('.'):
+                try:
+                    df = pl.read_parquet(f"{output_dir}/{f}")
+                    attempted |= set(df['tanggal'].dt.strftime('%Y-%m-%d').to_list())
+                except Exception:
+                    continue
+    return attempted
+
+
+def save_scrape_index(output_dir, attempted):
+    """Persist set of attempted dates ke sidecar file."""
+    if not attempted:
+        return
+    path = f"{output_dir}/.scrape_index.parquet"
+    df = pl.DataFrame({'tanggal': sorted(attempted)}).with_columns(
+        pl.col('tanggal').str.to_date('%Y-%m-%d')
+    )
+    df.write_parquet(path)
+
+
+def audit_missing_dates(output_dir, start_date, end_date):
+    """List tanggal di range yang tidak ada di FINAL parquet.
+    Memisahkan weekday gaps (perlu investigasi) vs weekend off-days (kemungkinan normal).
+    """
+    final_path = f"{output_dir}/harga_emas_FINAL.parquet"
+    if not os.path.exists(final_path):
+        print("FINAL parquet tidak ditemukan.")
+        return None
+
+    df = pl.read_parquet(final_path)
+    have = set(df['tanggal'].dt.strftime('%Y-%m-%d').to_list())
+
+    start = datetime.strptime(start_date, '%Y-%m-%d')
+    end   = datetime.strptime(end_date,   '%Y-%m-%d')
+    cur   = start
+    missing = []
+    while cur <= end:
+        label = cur.strftime('%Y-%m-%d')
+        if label not in have:
+            missing.append((label, cur.strftime('%a')))
+        cur += timedelta(days=1)
+
+    weekdays = [d for d, w in missing if w not in ('Sat', 'Sun')]
+    weekends = [d for d, w in missing if w in ('Sat', 'Sun')]
+    sat_count = sum(1 for d, w in missing if w == 'Sat')
+    sun_count = sum(1 for d, w in missing if w == 'Sun')
+
+    print(f"Total missing: {len(missing)} tanggal")
+    print(f"  - Weekday gaps (perlu investigasi): {len(weekdays)}")
+    print(f"  - Weekend off-days (kemungkinan normal): {len(weekends)}")
+    print(f"    breakdown: {sat_count} Sabtu, {sun_count} Minggu")
+    if weekdays:
+        print(f"  - Contoh weekday gaps (max 20): {weekdays[:20]}")
+    return missing
+
+
+def scrape_range(start_date, end_date, delay=1.0, output_dir='data_emas',
+                 refresh_index=False):
     os.makedirs(output_dir, exist_ok=True)
-    
+
+    if refresh_index:
+        attempted = set()
+        print("[REFRESH] Ignoring sidecar; akan re-attempt semua tanggal")
+    else:
+        attempted = load_scrape_index(output_dir)
+        if attempted:
+            print(f"[INDEX] Loaded {len(attempted)} tanggal yang sudah pernah di-attempt")
+
     start   = datetime.strptime(start_date, '%Y-%m-%d')
     end     = datetime.strptime(end_date,   '%Y-%m-%d')
     current = start
@@ -138,62 +218,65 @@ def scrape_range(start_date, end_date, delay=1.0, output_dir='data_emas'):
         nama_bulan = BULAN_ID[bulan]
         output_file = f"{output_dir}/{tahun}_{bulan:02d}.parquet"
 
-        # Skip kalau bulan ini sudah pernah di-scrape
-        if os.path.exists(output_file):
-            print(f"[SKIP] {tahun}/{nama_bulan} sudah ada, lewat...")
-            # Maju ke bulan berikutnya
-            if bulan == 12:
-                current = current.replace(year=tahun+1, month=1, day=1)
-            else:
-                current = current.replace(month=bulan+1, day=1)
-            continue
+        # Load existing month parquet (untuk merge/dedup kalau ada data baru)
+        df_existing = pl.read_parquet(output_file) if os.path.exists(output_file) else None
 
-        # Scrape semua hari dalam bulan ini
+        # Scrape semua hari dalam bulan ini, skip tanggal yang sudah pernah di-attempt
         bulan_rows = []
         while current.month == bulan and current <= end:
             label = current.strftime('%Y-%m-%d')
-            print(f"  Fetching {label}...", end=' ')
-
-            hasil = scrape_harga_emas(current.year, current.month, current.day)
-            if hasil:
-                bulan_rows.extend(hasil)
-                print(f"✓ {len(hasil)} baris")
+            if label in attempted:
+                # Sudah pernah di-attempt (data atau off-day), skip silent
+                pass
             else:
-                print("(skip)")
-
+                print(f"  Fetching {label}...", end=' ')
+                hasil = scrape_harga_emas(current.year, current.month, current.day)
+                if hasil:
+                    bulan_rows.extend(hasil)
+                    print(f"✓ {len(hasil)} baris")
+                else:
+                    print("(off-day)")
+                time.sleep(delay)
+            attempted.add(label)  # Track setiap attempt, terlepas hasilnya
             current += timedelta(days=1)
-            time.sleep(delay)
 
-        # Simpan checkpoint per bulan
+        # Merge & dedup kalau ada data baru
         if bulan_rows:
-            df_bulan = pl.DataFrame(bulan_rows)
-            df_bulan = df_bulan.with_columns(
+            df_new = pl.DataFrame(bulan_rows).with_columns(
                 pl.col('tanggal').str.to_date('%Y-%m-%d')
             )
-            df_bulan.write_parquet(output_file)
-            print(f"  ✓ Saved {output_file} ({len(df_bulan):,} baris)\n")
+            if df_existing is not None:
+                df_combined = pl.concat([df_existing, df_new]).unique(
+                    subset=['tanggal', 'satuan_gr'], keep='last'
+                ).sort(['tanggal', 'satuan_gr'])
+            else:
+                df_combined = df_new.sort(['tanggal', 'satuan_gr'])
+            df_combined.write_parquet(output_file)
+            print(f"  ✓ Saved {output_file} ({len(df_combined):,} baris)\n")
+
+    # Persist attempt index
+    save_scrape_index(output_dir, attempted)
 
     # Gabungkan semua file parquet jadi satu
     print("Menggabungkan semua file...")
-    all_files = sorted([f"{output_dir}/{f}" for f in os.listdir(output_dir) if f.endswith('.parquet')])
+    all_files = sorted([f"{output_dir}/{f}" for f in os.listdir(output_dir)
+                        if f.endswith('.parquet') and not f.startswith('.')])
     if not all_files:
         print(f"Tidak ada file parquet di {output_dir}, skip merge.")
         return None
     df_final = pl.concat([pl.read_parquet(f) for f in all_files])
     df_final = df_final.sort(['tanggal', 'satuan_gr'])
     df_final.write_parquet(f"{output_dir}/harga_emas_FINAL.parquet")
-    
-    # Menggunakan Polars syntax
+
     print(f"\n✓ Selesai! Total {len(df_final):,} baris, {df_final['tanggal'].n_unique():,} hari")
     print(f"✓ Tersimpan di {output_dir}/harga_emas_FINAL.parquet")
     return df_final
 
 
 # ── Test satu tanggal dulu ──
-tanggal_awal = '2018-02-01'
-tanggal_akhir = '2026-06-23'
-delay = 1.0
-output_file = 'data_emas_hargaemas-org'
-hasil = scrape_range(tanggal_awal, tanggal_akhir, delay, output_file)
-# df_test = pd.DataFrame(hasil)
-# df_test.to_csv('emas.csv', index=False)
+if __name__ == "__main__":
+    tanggal_awal = '2018-02-01'
+    tanggal_akhir = '2026-06-23'
+    delay = 1.0
+    output_file = 'data_emas_hargaemas-org'
+    hasil = scrape_range(tanggal_awal, tanggal_akhir, delay, output_file)
